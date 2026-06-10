@@ -44,21 +44,27 @@ class CalibratedModel:
 def calibrate_probabilities(
     model, 
     X_cal: np.ndarray, 
-    y_cal: np.ndarray
+    y_cal: np.ndarray,
+    probs_precomputed: bool = False,
 ) -> CalibratedModel:
     """
-    Fit isotonic regression calibrator on held-out calibration data.
-    
+    Fit isotonic regression calibrator.
+
     Args:
         model: Trained LightGBM model
-        X_cal: Calibration features
+        X_cal: Calibration features, OR precomputed raw probabilities
+               (e.g. out-of-fold CV predictions) if probs_precomputed=True
         y_cal: Calibration labels
-    
+        probs_precomputed: If True, X_cal is already raw probabilities.
+                           Preferred: pass pooled out-of-fold predictions,
+                           which match the distribution the model produces
+                           on genuinely unseen games.
+
     Returns:
         CalibratedModel wrapping the original model + calibrator
     """
     # Get raw probabilities on calibration set
-    raw_probs = model.predict(X_cal)
+    raw_probs = X_cal if probs_precomputed else model.predict(X_cal)
     
     # Fit isotonic regression
     calibrator = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")

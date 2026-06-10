@@ -1,24 +1,34 @@
 """
-Backtesting framework for evaluating model profitability.
+Backtesting framework for evaluating model profitability — honest edition.
 
-Simulates Kalshi trading over historical data using walk-forward
-predictions to estimate real-world performance.
+What changed vs v1 (IMPORTANT):
+  v1 generated synthetic market prices FROM THE GAME OUTCOME
+  (y_true * 0.3 + 0.35 + noise) — the simulated market knew who won,
+  so every ROI number it produced was meaningless.
 
-Key metrics:
-  - ROI (return on investment per bet)
-  - Total P&L
-  - Sharpe ratio of daily returns
-  - Max drawdown
-  - Win rate on placed bets
-  - Calibration quality
+  v2 supports two market sources:
+    1. REAL closing lines via --odds-file (CSV keyed by game_id with a
+       `market_home_prob` column). This is the only mode whose ROI means
+       anything about live trading.
+    2. DIAGNOSTIC mode (default): the "market" is a walk-forward logistic
+       regression on two public features (season margin diff, win pct diff).
+       It never sees outcomes. Beating it shows your model extracts more
+       signal than a naive public model — it does NOT prove an edge over
+       real markets, which are far sharper. Output is labeled accordingly.
+
+  Also new: Kalshi taker fees modeled on every entry, and predictions are
+  the walk-forward CALIBRATED out-of-fold probabilities saved by train.py.
 
 Usage:
-    python -m backtest.evaluate
+    python -m backtest.evaluate                      # diagnostic market
+    python -m backtest.evaluate --odds-file lines.csv  # real closing lines
 """
 import pandas as pd
 import numpy as np
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, brier_score_loss
 from pathlib import Path
+import argparse
 import json
 
 import sys
@@ -27,249 +37,224 @@ import config
 from model.predict import kelly_criterion
 
 
+def load_oof_predictions() -> pd.DataFrame:
+    path = config.MODEL_DIR / "oof_predictions.csv"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No OOF predictions at {path}. Run `python -m model.train` first."
+        )
+    oof = pd.read_csv(path, parse_dates=["date"])
+    prob_col = "cal_prob" if "cal_prob" in oof.columns else "raw_prob"
+    oof["model_prob"] = oof[prob_col]
+    return oof.sort_values("date").reset_index(drop=True)
+
+
+def build_diagnostic_market(oof: pd.DataFrame) -> np.ndarray:
+    """
+    Walk-forward logistic 'market': for each season, fit on PRIOR seasons'
+    simple features only. Never sees the current season or any outcome it
+    is pricing. Seasons without enough history get NaN (excluded).
+    """
+    feats = [c for c in ["diff_season_margin", "diff_season_win_pct"] if c in oof.columns]
+    if not feats:
+        raise ValueError("OOF file lacks simple feature columns — retrain with updated train.py")
+
+    prices = np.full(len(oof), np.nan)
+    seasons = sorted(oof["season"].unique())
+
+    for s in seasons:
+        prior = oof[oof["season"] < s].dropna(subset=feats)
+        cur_mask = (oof["season"] == s) & oof[feats].notna().all(axis=1)
+        if len(prior) < 2000 or cur_mask.sum() == 0:
+            continue
+        lr = LogisticRegression(max_iter=1000)
+        lr.fit(prior[feats].values, prior["y_true"].values)
+        prices[cur_mask.values] = lr.predict_proba(oof.loc[cur_mask, feats].values)[:, 1]
+
+    return np.clip(prices, 0.03, 0.97)
+
+
 def simulate_kalshi_trading(
     y_true: np.ndarray,
     model_probs: np.ndarray,
-    market_prices: np.ndarray = None,
+    market_prices: np.ndarray,
     bankroll: float = None,
     kelly_fraction: float = None,
     min_edge: float = None,
+    flat_staking: bool = True,
+    seasons: np.ndarray = None,
 ) -> dict:
     """
-    Simulate Kalshi trading over a sequence of games.
-    
-    Args:
-        y_true: Actual outcomes (1 = home win, 0 = away win)
-        model_probs: Model's predicted P(home win)
-        market_prices: Kalshi market prices for home team
-                      (if None, generates synthetic market prices)
-        bankroll: Starting bankroll
-        kelly_fraction: Kelly fraction to use
-        min_edge: Minimum edge threshold to place a bet
-    
-    Returns:
-        Dict with full trading simulation results
+    Simulate Kalshi trading. market_prices are REQUIRED — this function no
+    longer invents a market. Fees are charged on entry per Kalshi's formula.
     """
-    if bankroll is None:
-        bankroll = config.STARTING_BANKROLL
-    if kelly_fraction is None:
-        kelly_fraction = config.KELLY_FRACTION
-    if min_edge is None:
-        min_edge = config.MIN_EDGE_THRESHOLD
-    
-    if market_prices is None:
-        # Simulate market prices as noisy version of true probabilities
-        # In reality, you'd use historical Kalshi/odds data
-        np.random.seed(42)
-        noise = np.random.normal(0, 0.05, len(y_true))
-        market_prices = np.clip(
-            y_true.astype(float) * 0.3 + 0.35 + noise,  # centered around true prob
-            0.1, 0.9
-        )
-    
+    bankroll = bankroll or config.STARTING_BANKROLL
+    kelly_fraction = kelly_fraction or config.KELLY_FRACTION
+    min_edge = min_edge if min_edge is not None else config.MIN_EDGE_THRESHOLD
+    # Flat staking: size every bet off the starting bankroll. Honest for
+    # long backtests; compounding across decades produces absurd numbers.
+
     current_bankroll = bankroll
     peak_bankroll = bankroll
-    
     trades = []
     bankroll_history = [bankroll]
-    
+
     for i in range(len(y_true)):
-        model_prob = model_probs[i]
-        market_price = market_prices[i]
-        outcome = y_true[i]
-        
-        # Check both sides for value
-        home_edge = model_prob - market_price
-        away_edge = (1 - model_prob) - (1 - market_price)
-        
-        trade = {
-            "game_idx": i,
-            "model_prob": model_prob,
-            "market_price": market_price,
-            "outcome": outcome,
-        }
-        
-        if home_edge > min_edge:
-            # Bet on home team
-            bet_frac = kelly_criterion(model_prob, market_price, kelly_fraction)
-            bet_amount = min(current_bankroll * bet_frac, current_bankroll * config.MAX_BET_FRACTION)
-            
-            if bet_amount > 0.50:  # minimum bet size
-                # Buy home YES contract at market_price
-                contracts = bet_amount / market_price
-                
-                if outcome == 1:  # home wins
-                    profit = contracts * (1 - market_price)  # payout - cost
-                else:
-                    profit = -bet_amount  # lose entire bet
-                
-                current_bankroll += profit
-                peak_bankroll = max(peak_bankroll, current_bankroll)
-                
-                trade.update({
-                    "side": "HOME",
-                    "edge": home_edge,
-                    "bet_amount": bet_amount,
-                    "profit": profit,
-                    "won": outcome == 1,
-                    "bankroll_after": current_bankroll,
-                })
-            else:
-                trade.update({"side": "PASS", "edge": home_edge, "bet_amount": 0, "profit": 0, "won": None, "bankroll_after": current_bankroll})
-        
-        elif away_edge > min_edge:
-            # Bet on away team
-            away_market = 1 - market_price
-            bet_frac = kelly_criterion(1 - model_prob, away_market, kelly_fraction)
-            bet_amount = min(current_bankroll * bet_frac, current_bankroll * config.MAX_BET_FRACTION)
-            
+        p, price, outcome = model_probs[i], market_prices[i], y_true[i]
+        if np.isnan(price):
+            continue
+
+        # Evaluate both sides; fee makes the effective entry price worse
+        candidates = []
+        for side, side_p, side_price, wins in [
+            ("HOME", p, price, outcome == 1),
+            ("AWAY", 1 - p, 1 - price, outcome == 0),
+        ]:
+            fee_per_contract = config.kalshi_fee(1, side_price)
+            eff_price = side_price + fee_per_contract
+            edge = side_p - eff_price
+            if edge > min_edge:
+                candidates.append((edge, side, side_p, side_price, eff_price, wins))
+
+        trade = {"game_idx": i, "model_prob": p, "market_price": price,
+                 "outcome": outcome, "side": "PASS", "bet_amount": 0.0,
+                 "fee": 0.0, "profit": 0.0, "won": None,
+                 "season": seasons[i] if seasons is not None else None}
+
+        if candidates:
+            edge, side, side_p, side_price, eff_price, wins = max(candidates)
+            bet_frac = kelly_criterion(side_p, eff_price, kelly_fraction)
+            sizing_base = bankroll if flat_staking else current_bankroll
+            bet_amount = min(sizing_base * bet_frac,
+                             sizing_base * config.MAX_BET_FRACTION)
+
             if bet_amount > 0.50:
-                contracts = bet_amount / away_market
-                
-                if outcome == 0:  # away wins
-                    profit = contracts * (1 - away_market)
-                else:
-                    profit = -bet_amount
-                
+                contracts = bet_amount / side_price
+                fee = config.kalshi_fee(contracts, side_price)
+                profit = contracts * (1 - side_price) - fee if wins else -(bet_amount + fee)
                 current_bankroll += profit
                 peak_bankroll = max(peak_bankroll, current_bankroll)
-                
-                trade.update({
-                    "side": "AWAY",
-                    "edge": away_edge,
-                    "bet_amount": bet_amount,
-                    "profit": profit,
-                    "won": outcome == 0,
-                    "bankroll_after": current_bankroll,
-                })
-            else:
-                trade.update({"side": "PASS", "edge": away_edge, "bet_amount": 0, "profit": 0, "won": None, "bankroll_after": current_bankroll})
-        else:
-            trade.update({"side": "PASS", "edge": max(home_edge, away_edge), "bet_amount": 0, "profit": 0, "won": None, "bankroll_after": current_bankroll})
-        
+                trade.update({"side": side, "edge": edge, "bet_amount": bet_amount,
+                              "fee": fee, "profit": profit, "won": bool(wins)})
+
+        trade["bankroll_after"] = current_bankroll
         trades.append(trade)
         bankroll_history.append(current_bankroll)
-        
-        # Stop if bankrupt
+
         if current_bankroll < 1.0:
             print(f"💀 Bankrupt at game {i}!")
             break
-    
+
     trades_df = pd.DataFrame(trades)
-    active_trades = trades_df[trades_df["side"] != "PASS"]
-    
-    # Compute summary stats
-    if len(active_trades) > 0:
-        total_wagered = active_trades["bet_amount"].sum()
-        total_profit = active_trades["profit"].sum()
-        win_rate = active_trades["won"].mean()
-        roi = total_profit / total_wagered if total_wagered > 0 else 0
-        avg_edge = active_trades["edge"].mean()
-        
-        # Max drawdown
+    active = trades_df[trades_df["side"] != "PASS"]
+
+    if len(active) > 0:
+        total_wagered = active["bet_amount"].sum()
+        total_profit = active["profit"].sum()
+        total_fees = active["fee"].sum()
+        win_rate = active["won"].astype(bool).mean()
+        roi = total_profit / total_wagered
         bh = np.array(bankroll_history)
         running_max = np.maximum.accumulate(bh)
-        drawdowns = (bh - running_max) / running_max
-        max_drawdown = drawdowns.min()
+        max_drawdown = ((bh - running_max) / running_max).min()
     else:
-        total_wagered = total_profit = win_rate = roi = avg_edge = 0
-        max_drawdown = 0
-    
-    results = {
-        "starting_bankroll": bankroll,
-        "ending_bankroll": current_bankroll,
-        "total_profit": total_profit,
-        "total_wagered": total_wagered,
-        "roi": roi,
-        "n_games": len(y_true),
-        "n_bets": len(active_trades),
-        "bet_rate": len(active_trades) / len(y_true) if len(y_true) > 0 else 0,
-        "win_rate": win_rate,
-        "avg_edge": avg_edge,
-        "max_drawdown": max_drawdown,
+        total_wagered = total_profit = total_fees = win_rate = roi = max_drawdown = 0
+
+    return {
+        "starting_bankroll": bankroll, "ending_bankroll": current_bankroll,
+        "total_profit": total_profit, "total_wagered": total_wagered,
+        "total_fees": total_fees, "roi": roi,
+        "n_games": int(len(y_true)), "n_bets": int(len(active)),
+        "bet_rate": len(active) / max(len(y_true), 1),
+        "win_rate": win_rate, "max_drawdown": max_drawdown,
         "peak_bankroll": peak_bankroll,
-        "bankroll_history": bankroll_history,
-        "trades": trades_df,
+        "bankroll_history": bankroll_history, "trades": trades_df,
     }
-    
-    return results
 
 
-def run_backtest(cv_results: dict = None) -> dict:
-    """
-    Run a full backtest using walk-forward CV predictions.
-    
-    If cv_results not provided, runs the full pipeline.
-    """
-    if cv_results is None:
-        # Run full pipeline
-        from data.fetch_team_stats import load_historical_dataset
-        from features.engineer import build_features
-        from model.train import walk_forward_cv
-        
-        print("📊 Loading data...")
-        df = load_historical_dataset()
-        
-        print("🔧 Building features...")
-        X, y = build_features(df)
-        
-        print("🏋️ Running walk-forward CV...")
-        cv_results = walk_forward_cv(X, y)
-    
-    y_true = cv_results["all_val_true"]
-    model_probs = cv_results["all_val_preds"]
-    
-    print(f"\n{'='*60}")
-    print(f"BACKTEST SIMULATION")
-    print(f"{'='*60}")
-    print(f"Games: {len(y_true)}")
-    print(f"Starting bankroll: ${config.STARTING_BANKROLL:.2f}")
-    print(f"Kelly fraction: {config.KELLY_FRACTION}")
-    print(f"Min edge: {config.MIN_EDGE_THRESHOLD:.0%}")
-    
-    results = simulate_kalshi_trading(y_true, model_probs)
-    
-    print(f"\n{'─'*60}")
-    print(f"RESULTS")
-    print(f"{'─'*60}")
+def run_backtest(odds_file: str = None) -> dict:
+    oof = load_oof_predictions()
+
+    if odds_file:
+        market_label = f"REAL closing lines ({odds_file})"
+        lines = pd.read_csv(odds_file)
+        oof = oof.merge(lines[["game_id", "market_home_prob"]], on="game_id", how="left")
+        market = oof["market_home_prob"].values
+        matched = np.isfinite(market).sum()
+        print(f"📊 Matched real lines for {matched}/{len(oof)} games")
+    else:
+        market_label = "DIAGNOSTIC (walk-forward logistic on public features)"
+        market = build_diagnostic_market(oof)
+
+    valid = np.isfinite(market)
+    y_true = oof.loc[valid, "y_true"].values
+    model_probs = oof.loc[valid, "model_prob"].values
+    market = market[valid]
+
+    # Model quality vs the market, independent of betting strategy
+    model_ll = log_loss(y_true, model_probs)
+    market_ll = log_loss(y_true, market)
+
+    print(f"\n{'='*64}")
+    print(f"BACKTEST — market source: {market_label}")
+    print(f"{'='*64}")
+    print(f"Games: {len(y_true)} | Bankroll: ${config.STARTING_BANKROLL:.0f} | "
+          f"Kelly: {config.KELLY_FRACTION} | Min edge: {config.MIN_EDGE_THRESHOLD:.0%} (after fees)")
+    print(f"\nLog loss — model: {model_ll:.4f} | market: {market_ll:.4f} "
+          f"({'model BEATS market' if model_ll < market_ll else 'market beats model'})")
+
+    seasons_arr = oof.loc[valid, "season"].values
+    results = simulate_kalshi_trading(y_true, model_probs, market, seasons=seasons_arr)
+
+    print(f"\n{'─'*64}\nRESULTS\n{'─'*64}")
     print(f"  Ending bankroll:  ${results['ending_bankroll']:.2f}")
     print(f"  Total profit:     ${results['total_profit']:.2f}")
+    print(f"  Total fees paid:  ${results['total_fees']:.2f}")
     print(f"  ROI:              {results['roi']:.1%}")
-    print(f"  Bets placed:      {results['n_bets']} / {results['n_games']} ({results['bet_rate']:.0%} of games)")
+    print(f"  Bets placed:      {results['n_bets']} / {results['n_games']} "
+          f"({results['bet_rate']:.0%} of games)")
     print(f"  Win rate:         {results['win_rate']:.1%}")
-    print(f"  Avg edge:         {results['avg_edge']:.1%}")
     print(f"  Max drawdown:     {results['max_drawdown']:.1%}")
-    print(f"  Peak bankroll:    ${results['peak_bankroll']:.2f}")
-    print(f"{'─'*60}")
-    
-    # Profitability assessment
-    if results["roi"] > 0.03:
-        print(f"\n✅ Model shows positive ROI ({results['roi']:.1%})")
-        print(f"   This is promising but backtest ≠ live performance.")
-        print(f"   Paper trade for 2-3 weeks before using real money.")
-    elif results["roi"] > 0:
-        print(f"\n⚠️  Model shows marginal ROI ({results['roi']:.1%})")
-        print(f"   Edge is small — fees and variance could eat this up.")
-        print(f"   Consider improving features before going live.")
-    else:
-        print(f"\n❌ Model shows negative ROI ({results['roi']:.1%})")
-        print(f"   Don't trade with real money. Improve the model first.")
-    
-    # Save backtest results
-    results_summary = {k: v for k, v in results.items() 
-                       if k not in ["bankroll_history", "trades"]}
-    results_summary = {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
-                       for k, v in results_summary.items()}
-    
-    output_path = config.LOGS_DIR / "backtest_results.json"
-    with open(output_path, "w") as f:
-        json.dump(results_summary, f, indent=2)
-    print(f"\n📝 Results saved to {output_path}")
-    
+    print(f"{'─'*64}")
+
+    # Per-season breakdown (flat staking, so seasons are comparable)
+    tdf = results["trades"]
+    act = tdf[tdf["side"] != "PASS"]
+    if len(act) > 0 and act["season"].notna().any():
+        print(f"\n  {'Season':>6} {'Bets':>6} {'WinRate':>8} {'Wagered':>10} {'Profit':>10} {'ROI':>7}")
+        for s, grp in act.groupby("season"):
+            roi_s = grp["profit"].sum() / grp["bet_amount"].sum()
+            print(f"  {int(s):>6} {len(grp):>6} {grp['won'].astype(bool).mean():>8.1%} "
+                  f"${grp['bet_amount'].sum():>9.0f} ${grp['profit'].sum():>9.2f} {roi_s:>7.1%}")
+        n_pos = sum(grp['profit'].sum() > 0 for _, grp in act.groupby('season'))
+        print(f"\n  Profitable seasons: {n_pos}/{act['season'].nunique()}")
+
+    if odds_file is None:
+        print("\n⚠️  DIAGNOSTIC MODE: the market here is a naive logistic model.")
+        print("   Beating it means your model adds signal beyond simple public")
+        print("   stats. It does NOT demonstrate an edge over real markets —")
+        print("   sportsbooks and Kalshi are far sharper than this proxy.")
+        print("   Get real closing lines and rerun with --odds-file before")
+        print("   drawing ANY conclusion about profitability.")
+
+    summary = {k: (float(v) if isinstance(v, (np.floating, np.integer, int, float)) else v)
+               for k, v in results.items() if k not in ["bankroll_history", "trades"]}
+    summary["market_source"] = market_label
+    summary["model_log_loss"] = float(model_ll)
+    summary["market_log_loss"] = float(market_ll)
+
+    out = config.LOGS_DIR / "backtest_results.json"
+    with open(out, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n📝 Results saved to {out}")
     return results
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--odds-file", type=str, default=None,
+                        help="CSV with game_id + market_home_prob columns (real closing lines)")
+    args = parser.parse_args()
     print("🏀 NCAAB Kalshi Backtest")
-    print("=" * 60)
-    results = run_backtest()
+    print("=" * 64)
+    run_backtest(odds_file=args.odds_file)

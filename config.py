@@ -53,12 +53,20 @@ WALK_FORWARD_VAL_SEASONS = 1
 # ── Betting / Kalshi ──────────────────────────────────────────────────────
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", 200))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", 0.25))  # quarter Kelly
-MIN_EDGE_THRESHOLD = float(os.getenv("MIN_EDGE_THRESHOLD", 0.20))  # x% min edge to bet
+MIN_EDGE_THRESHOLD = float(os.getenv("MIN_EDGE_THRESHOLD", 0.05))  # min edge AFTER fees
 MAX_BET_FRACTION = 0.03  # never risk more than x% of bankroll on one game
 
-# Kalshi specific
-KALSHI_FEE_RATE = 0.0  # Kalshi charges no fees on contracts currently
-# but they take a cut on withdrawals — factor that in separately
+# Kalshi trading fees: charged on trade execution (taker), not settlement.
+# fee = ceil(0.07 * contracts * price * (1 - price)), rounded up to the cent.
+# At a 50c price that's ~1.75c per contract — meaningful on thin edges.
+KALSHI_FEE_COEF = 0.07
+
+
+def kalshi_fee(contracts: float, price: float) -> float:
+    """Kalshi taker fee in dollars for buying `contracts` at `price`."""
+    import math
+    raw = KALSHI_FEE_COEF * contracts * price * (1 - price)
+    return math.ceil(raw * 100) / 100  # round up to next cent
 
 # ── Odds API ───────────────────────────────────────────────────────────────
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"

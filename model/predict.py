@@ -241,6 +241,7 @@ def generate_predictions(
     odds_df: pd.DataFrame = None,
     bankroll: float = None,
     dry_run: bool = False,
+    neutral_override: int = None,
 ) -> pd.DataFrame:
     """
     Generate real predictions using the trained model.
@@ -422,7 +423,15 @@ def generate_predictions(
             if len(matchups) > 0 and "conference_competition" in matchups.columns:
                 is_conf = int(matchups["conference_competition"].max())
         features["is_conference_game"] = is_conf
-        features["neutral_site"] = 0
+        # Neutral site: was hardcoded to 0, which baked home-court advantage
+        # into every March tournament game — exactly when Kalshi volume peaks.
+        # Heuristic: conference tournaments + NCAA tournament run ~Mar 9 onward.
+        # Override with --neutral 0/1 when you know the answer.
+        today_dt = datetime.now()
+        if neutral_override is not None:
+            features["neutral_site"] = neutral_override
+        else:
+            features["neutral_site"] = int(today_dt.month == 3 and today_dt.day >= 9 or today_dt.month == 4)
 
         # Build feature vector in correct column order
         feature_vector = []
@@ -442,13 +451,16 @@ def generate_predictions(
         model_home_prob = float(model.predict(feature_vector)[0])
         model_away_prob = 1 - model_home_prob
 
-        # Evaluate edge on both sides
-        home_edge = model_home_prob - kalshi_home
-        away_edge = model_away_prob - kalshi_away
+        # Evaluate edge on both sides, AFTER Kalshi taker fees.
+        # Fee worsens your effective entry price; thin edges die here.
+        home_eff = kalshi_home + config.kalshi_fee(1, kalshi_home)
+        away_eff = kalshi_away + config.kalshi_fee(1, kalshi_away)
+        home_edge = model_home_prob - home_eff
+        away_edge = model_away_prob - away_eff
 
-        # Kelly sizing
-        home_kelly = kelly_criterion(model_home_prob, kalshi_home)
-        away_kelly = kelly_criterion(model_away_prob, kalshi_away)
+        # Kelly sizing on effective (fee-inclusive) prices
+        home_kelly = kelly_criterion(model_home_prob, home_eff)
+        away_kelly = kelly_criterion(model_away_prob, away_eff)
 
         # Determine best trade
         if home_edge > config.MIN_EDGE_THRESHOLD and home_kelly > 0:
@@ -545,10 +557,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate NCAAB predictions")
     parser.add_argument("--bankroll", type=float, default=None, help="Current bankroll")
     parser.add_argument("--dry-run", action="store_true", help="Use synthetic odds")
+    parser.add_argument("--neutral", type=int, default=None, choices=[0, 1],
+                        help="Force neutral_site flag (default: date-based heuristic)")
     args = parser.parse_args()
 
     print("🏀 NCAAB Kalshi Predictions")
     print("=" * 60)
     print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    recs = generate_predictions(bankroll=args.bankroll, dry_run=args.dry_run)
+    recs = generate_predictions(bankroll=args.bankroll, dry_run=args.dry_run,
+                                neutral_override=args.neutral)

@@ -85,9 +85,14 @@ def compute_team_season_stats(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         )
 
         # Offensive and defensive efficiency (pts per ~70 possessions)
-        pace_clip = team_games["pace"].clip(lower=50)
-        team_games["off_efficiency"] = team_games["season_pts_for"] / pace_clip * 70
-        team_games["def_efficiency"] = team_games["season_pts_against"] / pace_clip * 70
+        # Use *season-average* pace, not the single most recent game's pace —
+        # otherwise one weird game distorts the season-long efficiency numbers.
+        season_pace = (
+            team_games.groupby("season")["pace"]
+            .expanding().mean().reset_index(level=0, drop=True)
+        ).clip(lower=50)
+        team_games["off_efficiency"] = team_games["season_pts_for"] / season_pace * 70
+        team_games["def_efficiency"] = team_games["season_pts_against"] / season_pace * 70
         team_games["net_efficiency"] = team_games["off_efficiency"] - team_games["def_efficiency"]
 
         # ── NEW: Win streak (consecutive wins, negative = consecutive losses) ──
@@ -205,175 +210,143 @@ def compute_rest_days(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """
-    Main feature engineering function (v2).
 
-    New features compared to v1:
-      - Strength of schedule (home_sos, away_sos, diff_sos)
-      - Win streak / momentum
-      - Margin volatility
-      - Scoring consistency
-      - Blowout rate and close game rate
-      - Season stage (games_played as proxy)
-      - Absolute season margin (not just differential)
-    """
-    print("🔧 Engineering features (v2)...")
-    df = df.sort_values("date").copy()
+STAT_COLS_BASE = ["season_margin", "season_win_pct", "off_efficiency", "def_efficiency",
+                  "net_efficiency", "games_played", "win_streak", "margin_volatility",
+                  "scoring_consistency", "blowout_rate", "close_game_rate"]
 
-    # Step 1: Compute team rolling stats
-    print("   Computing team rolling stats...")
-    team_stats = compute_team_season_stats(df)
+def _team_records(df):
+    h = df[["date","season","home_team","home_score","away_score","pace"]].copy()
+    h.columns = ["date","season","team","pts_for","pts_against","pace"]
+    a = df[["date","season","away_team","away_score","home_score","pace"]].copy()
+    a.columns = ["date","season","team","pts_for","pts_against","pace"]
+    return pd.concat([h, a]).sort_values("date", kind="stable").reset_index(drop=True)
 
-    # Step 2: Compute strength of schedule
-    print("   Computing strength of schedule...")
-    sos = compute_strength_of_schedule(df, team_stats)
+def _compute_stats(r):
+    r = r.copy()
+    r["margin"] = r["pts_for"] - r["pts_against"]
+    r["win"] = (r["margin"] > 0).astype(float)
+    g = r.groupby("team", sort=False)
+    for w in config.ROLLING_WINDOWS:
+        p = f"roll_{w}"
+        for col in ["pts_for","pts_against","pace","margin","win"]:
+            name = "win_pct" if col == "win" else col
+            r[f"{p}_{name}"] = g[col].transform(lambda s, w=w: s.rolling(w, min_periods=1).mean())
+    gs = r.groupby(["team","season"], sort=False)
+    r["season_pts_for"] = gs["pts_for"].transform(lambda s: s.expanding().mean())
+    r["season_pts_against"] = gs["pts_against"].transform(lambda s: s.expanding().mean())
+    r["season_margin"] = r["season_pts_for"] - r["season_pts_against"]
+    r["season_win_pct"] = gs["win"].transform(lambda s: s.expanding().mean())
+    r["games_played"] = gs.cumcount() + 1
+    season_pace = gs["pace"].transform(lambda s: s.expanding().mean()).clip(lower=50)
+    r["off_efficiency"] = r["season_pts_for"] / season_pace * 70
+    r["def_efficiency"] = r["season_pts_against"] / season_pace * 70
+    r["net_efficiency"] = r["off_efficiency"] - r["def_efficiency"]
+    def streaks(wins):
+        out, cur = [], 0
+        for w in wins:
+            cur = max(1, cur + 1) if w == 1 else min(-1, cur - 1)
+            out.append(cur)
+        return pd.Series(out, index=wins.index)
+    r["win_streak"] = g["win"].transform(streaks)
+    r["margin_volatility"] = g["margin"].transform(lambda s: s.rolling(10, min_periods=3).std())
+    rm = g["pts_for"].transform(lambda s: s.rolling(10, min_periods=3).mean())
+    rs = g["pts_for"].transform(lambda s: s.rolling(10, min_periods=3).std())
+    r["scoring_consistency"] = rs / rm.clip(lower=1)
+    r["blowout_rate"] = g["margin"].transform(lambda s: (s >= 15).astype(float).rolling(15, min_periods=3).mean())
+    r["close_game_rate"] = g["margin"].transform(lambda s: (s.abs() <= 5).astype(float).rolling(15, min_periods=3).mean())
+    return r
 
-    # Step 3: Compute rest days
-    print("   Computing rest days...")
-    df = compute_rest_days(df)
+def _prev_distinct_date(rec, cols):
+    """Per (team,date): value of `cols` at the team's last row of the PREVIOUS
+    distinct date. Returns a frame with unique (team,date) keys."""
+    last = rec.groupby(["team","date"], sort=False)[cols].last().reset_index()
+    shifted = last.groupby("team", sort=False)[cols].shift(1)
+    return pd.concat([last[["team","date"]], shifted], axis=1)
 
-    # Step 4: Build feature matrix
-    print("   Building feature matrix...")
-    feature_rows = []
+def build_features(df):
+    df = df.sort_values("date", kind="stable").copy()
+    rec = _compute_stats(_team_records(df))
 
-    for idx, game in df.iterrows():
-        home = game["home_team"]
-        away = game["away_team"]
-        date = game["date"]
+    roll_cols = [f"roll_{w}_{n}" for w in config.ROLLING_WINDOWS
+                 for n in ["pts_for","pts_against","margin","win_pct","pace"]]
+    stat_cols = roll_cols + STAT_COLS_BASE
 
-        features = {
-            "game_id": game["game_id"],
-            "date": date,
-            "season": game["season"],
-            "home_team": home,
-            "away_team": away,
-        }
+    g = rec.groupby("team", sort=False)
+    rec["gnum"] = g.cumcount()
 
-        # Get latest team stats BEFORE this game
-        for team, label in [(home, "home"), (away, "away")]:
-            if team in team_stats:
-                prior = team_stats[team][team_stats[team]["date"] < date]
-                if len(prior) >= config.MIN_GAMES_PLAYED:
-                    latest = prior.iloc[-1]
+    prior = _prev_distinct_date(rec, stat_cols)
+    nprior = rec.groupby(["team","date"], sort=False)["gnum"].min().reset_index()
+    prior = prior.merge(nprior, on=["team","date"])
+    below = prior["gnum"] < config.MIN_GAMES_PLAYED
+    prior.loc[below, stat_cols] = np.nan
+    prior = prior.set_index(["team","date"])
 
-                    for window in config.ROLLING_WINDOWS:
-                        wp = f"roll_{window}"
-                        features[f"{label}_{wp}_pts_for"] = latest.get(f"{wp}_pts_for", np.nan)
-                        features[f"{label}_{wp}_pts_against"] = latest.get(f"{wp}_pts_against", np.nan)
-                        features[f"{label}_{wp}_margin"] = latest.get(f"{wp}_margin", np.nan)
-                        features[f"{label}_{wp}_win_pct"] = latest.get(f"{wp}_win_pct", np.nan)
-                        features[f"{label}_{wp}_pace"] = latest.get(f"{wp}_pace", np.nan)
+    # ── SOS ──
+    opp_prior = _prev_distinct_date(rec, ["season_margin"]).rename(
+        columns={"season_margin": "opp_prior_sm"}).set_index(["team","date"])["opp_prior_sm"]
+    hh = df[["date","home_team","away_team"]].copy(); hh.columns=["date","team","opponent"]
+    aa = df[["date","away_team","home_team"]].copy(); aa.columns=["date","team","opponent"]
+    longg = pd.concat([hh, aa]).sort_values("date", kind="stable").reset_index(drop=True)
+    longg["opp_m"] = opp_prior.reindex(
+        pd.MultiIndex.from_arrays([longg["opponent"], longg["date"]])).values
+    longg["opp_m"] = longg["opp_m"].fillna(0.0)
+    longg["sos_incl"] = longg.groupby("team", sort=False)["opp_m"].transform(
+        lambda s: s.expanding().mean())
+    sos_prior = _prev_distinct_date(longg, ["sos_incl"]).rename(
+        columns={"sos_incl": "sos"}).set_index(["team","date"])["sos"]
 
-                    features[f"{label}_season_margin"] = latest.get("season_margin", np.nan)
-                    features[f"{label}_season_win_pct"] = latest.get("season_win_pct", np.nan)
-                    features[f"{label}_off_efficiency"] = latest.get("off_efficiency", np.nan)
-                    features[f"{label}_def_efficiency"] = latest.get("def_efficiency", np.nan)
-                    features[f"{label}_net_efficiency"] = latest.get("net_efficiency", np.nan)
-                    features[f"{label}_games_played"] = latest.get("games_played", np.nan)
+    # ── Rest days: per-GAME, replicating the original sequential loop exactly
+    # (a doubleheader's second game gets rest=0, keyed by game not by date) ──
+    n = len(df)
+    teams_iv = np.empty(2 * n, dtype=object)
+    teams_iv[0::2] = df["home_team"].values
+    teams_iv[1::2] = df["away_team"].values
+    dates_iv = np.repeat(pd.to_datetime(df["date"]).values, 2)
+    longr = pd.DataFrame({"team": teams_iv, "date": dates_iv})
+    prevd = longr.groupby("team", sort=False)["date"].shift(1)
+    rest_iv = (longr["date"] - prevd).dt.days.clip(upper=14).fillna(7).values
 
-                    # NEW v2 features
-                    features[f"{label}_win_streak"] = latest.get("win_streak", 0)
-                    features[f"{label}_margin_volatility"] = latest.get("margin_volatility", np.nan)
-                    features[f"{label}_scoring_consistency"] = latest.get("scoring_consistency", np.nan)
-                    features[f"{label}_blowout_rate"] = latest.get("blowout_rate", np.nan)
-                    features[f"{label}_close_game_rate"] = latest.get("close_game_rate", np.nan)
+    # ── Assemble per-game ──
+    out = df[["game_id","date","season","home_team","away_team"]].copy()
+    out["_target_home_win"] = df["home_win"].values
+    for label, tcol in [("home","home_team"), ("away","away_team")]:
+        pidx = pd.MultiIndex.from_arrays([df[tcol], df["date"]])
+        sub = prior.reindex(pidx)
+        for c in stat_cols:
+            out[f"{label}_{c}"] = sub[c].values
+        out[f"{label}_sos"] = sos_prior.reindex(pidx).values
+    out["home_rest_days"] = rest_iv[0::2]
+    out["away_rest_days"] = rest_iv[1::2]
+    out["rest_advantage"] = out["home_rest_days"] - out["away_rest_days"]
 
-            # SOS lookup
-            if team in sos:
-                team_sos = sos[team]
-                # Find most recent SOS before this date
-                prior_dates = [d for d in team_sos if d < date]
-                if prior_dates:
-                    latest_date = max(prior_dates)
-                    features[f"{label}_sos"] = team_sos[latest_date]
+    for w in config.ROLLING_WINDOWS:
+        p = f"roll_{w}"
+        out[f"diff_{p}_margin"] = out[f"home_{p}_margin"] - out[f"away_{p}_margin"]
+        out[f"diff_{p}_scoring"] = out[f"home_{p}_pts_for"] - out[f"away_{p}_pts_for"]
+    out["diff_net_efficiency"] = out["home_net_efficiency"] - out["away_net_efficiency"]
+    out["diff_season_win_pct"] = out["home_season_win_pct"] - out["away_season_win_pct"]
+    out["diff_season_margin"] = out["home_season_margin"] - out["away_season_margin"]
+    out["diff_sos"] = out["home_sos"] - out["away_sos"]
+    out["diff_win_streak"] = out["home_win_streak"].fillna(0) - out["away_win_streak"].fillna(0)
+    out["diff_blowout_rate"] = out["home_blowout_rate"] - out["away_blowout_rate"]
+    out["home_adj_margin"] = out["home_season_margin"] - out["home_sos"]
+    out["away_adj_margin"] = out["away_season_margin"] - out["away_sos"]
+    out["diff_adj_margin"] = out["home_adj_margin"] - out["away_adj_margin"]
+    out["is_conference_game"] = df.get("is_conference_game", pd.Series(0, index=df.index)).values
+    out["neutral_site"] = df.get("neutral_site", pd.Series(0, index=df.index)).values
 
-        # ── Matchup differentials ──
-        for window in config.ROLLING_WINDOWS:
-            wp = f"roll_{window}"
-            h_margin = features.get(f"home_{wp}_margin")
-            a_margin = features.get(f"away_{wp}_margin")
-            if h_margin is not None and a_margin is not None:
-                features[f"diff_{wp}_margin"] = h_margin - a_margin
+    fcols = get_feature_columns(out)
+    out = out.dropna(subset=fcols, thresh=int(len(fcols) * 0.5))
+    y = out.pop("_target_home_win").astype(int)
+    return out.reset_index(drop=True), y.reset_index(drop=True)
 
-            h_eff = features.get(f"home_{wp}_pts_for")
-            a_eff = features.get(f"away_{wp}_pts_for")
-            if h_eff is not None and a_eff is not None:
-                features[f"diff_{wp}_scoring"] = h_eff - a_eff
 
-        # Efficiency differential
-        h_net = features.get("home_net_efficiency")
-        a_net = features.get("away_net_efficiency")
-        if h_net is not None and a_net is not None:
-            features["diff_net_efficiency"] = h_net - a_net
-
-        # Win pct differential
-        h_wp = features.get("home_season_win_pct")
-        a_wp = features.get("away_season_win_pct")
-        if h_wp is not None and a_wp is not None:
-            features["diff_season_win_pct"] = h_wp - a_wp
-
-        # Season margin differential (key for distinguishing blowouts)
-        h_sm = features.get("home_season_margin")
-        a_sm = features.get("away_season_margin")
-        if h_sm is not None and a_sm is not None:
-            features["diff_season_margin"] = h_sm - a_sm
-
-        # NEW: SOS differential
-        h_sos = features.get("home_sos")
-        a_sos = features.get("away_sos")
-        if h_sos is not None and a_sos is not None:
-            features["diff_sos"] = h_sos - a_sos
-
-        # NEW: Win streak differential
-        h_streak = features.get("home_win_streak", 0)
-        a_streak = features.get("away_win_streak", 0)
-        features["diff_win_streak"] = (h_streak or 0) - (a_streak or 0)
-
-        # NEW: Blowout rate differential
-        h_blow = features.get("home_blowout_rate")
-        a_blow = features.get("away_blowout_rate")
-        if h_blow is not None and a_blow is not None:
-            features["diff_blowout_rate"] = h_blow - a_blow
-
-        # NEW: SOS-adjusted margin (team margin minus SOS)
-        # A team with +10 margin against a +5 SOS schedule is less impressive
-        # than +10 margin against a -5 SOS schedule
-        if h_sm is not None and h_sos is not None:
-            features["home_adj_margin"] = h_sm - (h_sos or 0)
-        if a_sm is not None and a_sos is not None:
-            features["away_adj_margin"] = a_sm - (a_sos or 0)
-        h_adj = features.get("home_adj_margin")
-        a_adj = features.get("away_adj_margin")
-        if h_adj is not None and a_adj is not None:
-            features["diff_adj_margin"] = h_adj - a_adj
-
-        # Rest and context features
-        features["home_rest_days"] = game["home_rest_days"]
-        features["away_rest_days"] = game["away_rest_days"]
-        features["rest_advantage"] = game["rest_advantage"]
-        features["is_conference_game"] = game.get("is_conference_game", 0)
-        features["neutral_site"] = game.get("neutral_site", 0)
-
-        feature_rows.append(features)
-
-    features_df = pd.DataFrame(feature_rows)
-
-    # Drop rows with too many missing features (early season games)
-    feature_cols = get_feature_columns(features_df)
-    features_df = features_df.dropna(subset=feature_cols, thresh=len(feature_cols) * 0.5)
-
-    # Align target
-    y = df.loc[features_df.index, "home_win"]
-
-    print(f"   ✅ Built {len(features_df)} samples with {len(feature_cols)} features")
-
-    return features_df, y
 
 
 def get_feature_columns(df: pd.DataFrame) -> list[str]:
     """Return the list of columns to use as model features."""
-    exclude = {"game_id", "date", "season", "home_team", "away_team"}
+    exclude = {"game_id", "date", "season", "home_team", "away_team", "_target_home_win"}
     return [
         c for c in df.columns
         if c not in exclude and df[c].dtype in [np.float64, np.int64, float, int]
