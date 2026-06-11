@@ -45,6 +45,34 @@ ABBREV = {
     "okla": "oklahoma", "colo": "colorado", "conn": "connecticut",
 }
 
+# Explicit overrides for SBR names the fuzzy matcher can't resolve
+# (verified against ESPN displayNames in historical_games.csv).
+EXPLICIT_MAP = {
+    "CalPolySLO": "Cal Poly Mustangs",
+    "CharlestonSou": "Charleston Southern Buccaneers",
+    "CollCharleston": "Charleston Cougars",
+    "CollOfCharleston": "Charleston Cougars",
+    "DixieState": "Utah Tech Trailblazers",     # renamed in 2022
+    "EastTennSt.": "East Tennessee State Buccaneers",
+    "EastTennState": "East Tennessee State Buccaneers",
+    "FairDickinson": "Fairleigh Dickinson Knights",
+    "FlaAtlantic": "Florida Atlantic Owls",
+    "FlaGulfCoast": "Florida Gulf Coast Eagles",
+    "FullertonSt.": "Cal State Fullerton Titans",
+    "GeoWashington": "George Washington Revolutionaries",
+    "IPFW": "Purdue Fort Wayne Mastodons",       # renamed in 2018
+    "MDBaltimoreCo": "UMBC Retrievers",
+    "MDEasternShore": "Maryland Eastern Shore Hawks",
+    "MoKansasCity": "Kansas City Roos",
+    "Mt.St.Mary's": "Mount St. Mary's Mountaineers",
+    "NDakotaSt": "North Dakota State Bison",
+    "No.Colorado": "Northern Colorado Bears",
+    "NoIllinois": "Northern Illinois Huskies",
+    "NorthernArz": "Northern Arizona Lumberjacks",
+    # Non-D1 exhibition opponents — no ESPN equivalent, intentionally absent:
+    # CentralMissouriSt, MetroState, PRMayaguez, IUPUI (pre-rename gaps)
+}
+
 
 def normalize(name: str) -> str:
     """Lowercase, strip punctuation/spaces: 'Ohio State' -> 'ohiostate'."""
@@ -90,6 +118,8 @@ def build_team_mapping(espn_teams: list[str]) -> dict[str, str]:
 
 
 def match_team(sbr_name: str, mapping: dict[str, str]) -> str | None:
+    if sbr_name in EXPLICIT_MAP:
+        return EXPLICIT_MAP[sbr_name]
     key = sbr_normalize(sbr_name)
     if key in mapping:
         return mapping[key]
@@ -171,26 +201,36 @@ def main():
     lines["away_team"] = lines["sbr_away"].map(name_map)
     lines = lines.dropna(subset=["home_team", "away_team"])
 
-    # Merge to ESPN game_ids. Neutral-site games may have home/away flipped
-    # between SBR and ESPN, so try both orientations.
+    # Merge to ESPN game_ids. TWO quirks to handle:
+    #   1. ESPN dates are UTC — evening ET games are stamped with the NEXT
+    #      day, so each SBR date must also try sbr_date + 1.
+    #   2. Neutral-site games may have home/away flipped between sources.
+    # Candidates are tried in priority order: same-date straight, next-date
+    # straight, same-date flipped, next-date flipped.
     key_cols = ["date", "home_team", "away_team"]
     hist_keyed = hist[["game_id"] + key_cols]
-    merged = lines.merge(hist_keyed, on=key_cols, how="left")
 
-    flipped = merged["game_id"].isna()
-    if flipped.any():
-        flip = merged.loc[flipped, ["date", "away_team", "home_team",
-                                    "market_home_prob", "season", "neutral"]].copy()
-        flip.columns = ["date", "home_team", "away_team",
-                        "market_home_prob", "season", "neutral"]
-        flip["market_home_prob"] = 1 - flip["market_home_prob"]
-        flip = flip.merge(hist_keyed, on=key_cols, how="left")
-        flip = flip.dropna(subset=["game_id"])
-        merged = pd.concat([merged.dropna(subset=["game_id"]), flip],
-                           ignore_index=True)
-    else:
-        merged = merged.dropna(subset=["game_id"])
+    lines = lines.reset_index(drop=True)
+    lines["sbr_row"] = lines.index
 
+    candidates = []
+    for prio, (shift, flip) in enumerate(
+            [(0, False), (1, False), (0, True), (1, True)]):
+        c = lines.copy()
+        if shift:
+            c["date"] = (pd.to_datetime(c["date"])
+                         + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+        if flip:
+            c[["home_team", "away_team"]] = c[["away_team", "home_team"]].values
+            c["market_home_prob"] = 1 - c["market_home_prob"]
+        c["prio"] = prio
+        candidates.append(c)
+
+    merged = (pd.concat(candidates, ignore_index=True)
+              .merge(hist_keyed, on=key_cols, how="inner")
+              .sort_values("prio"))
+    # One ESPN game per SBR row and vice versa, best priority wins
+    merged = merged.drop_duplicates(subset="sbr_row")
     merged = merged.drop_duplicates(subset="game_id")
     out = merged[["game_id", "date", "season", "market_home_prob", "neutral"]]
     out_path = config.DATA_DIR / "closing_lines.csv"
