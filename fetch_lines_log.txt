@@ -1,0 +1,23 @@
+📡 2007-08 ... 3474 games
+📡 2008-09 ... 3439 games
+📡 2009-10 ... 3636 games
+📡 2010-11 ... 3749 games
+📡 2011-12 ... 3738 games
+📡 2012-13 ... 3860 games
+📡 2013-14 ... 3864 games
+📡 2014-15 ... 3887 games
+📡 2015-16 ... 3913 games
+📡 2016-17 ... 3885 games
+📡 2017-18 ... 3922 games
+📡 2018-19 ... 5572 games
+📡 2019-20 ... 5320 games
+📡 2020-21 ... 3808 games
+
+Team matching: 445/495 matched
+   Unmatched (add to ABBREV or ignore): ['CalPolySLO', 'CentralMissouriSt', 'CharlestonSou', 'CollCharleston', 'CollOfCharleston', 'DixieState', 'EastTennSt.', 'EastTennState', 'FairDickinson', 'FlaAtlantic', 'FlaGulfCoast', 'FullertonSt.', 'GeoWashington', 'IPFW', 'IUPUI', 'MDBaltimoreCo', 'MDEasternShore', 'MetroState', 'MoKansasCity', "Mt.St.Mary's", 'NDakotaSt', 'No.Colorado', 'NoIllinois', 'NorthernArz', 'PRMayaguez']
+
+✅ 10575 games with closing lines matched to ESPN game_ids
+   (13% of 80148 ESPN games in those seasons)
+   Saved to /Users/danielkhani/PycharmProjects/ncaab-kalshi-model/data/stored/closing_lines.csv
+
+Next: python -m backtest.evaluate --odds-file /Users/danielkhani/PycharmProjects/ncaab-kalshi-model/data/stored/closing_lines.csv
