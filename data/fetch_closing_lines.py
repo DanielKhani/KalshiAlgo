@@ -69,8 +69,30 @@ EXPLICIT_MAP = {
     "No.Colorado": "Northern Colorado Bears",
     "NoIllinois": "Northern Illinois Huskies",
     "NorthernArz": "Northern Arizona Lumberjacks",
+    # Second batch (the first unmatched printout was truncated at 25 names):
+    "SCUpstate": "South Carolina Upstate Spartans",
+    "SCarUpstate": "South Carolina Upstate Spartans",
+    "USC-Upstate": "South Carolina Upstate Spartans",
+    "USCUpstate": "South Carolina Upstate Spartans",
+    "SDakotaSt": "South Dakota State Jackrabbits",
+    "SaintMarysCA": "Saint Mary's Gaels",
+    "SanJoseState": "San José State Spartans",     # accented é broke the fuzzy match
+    "SoCarolinaSt": "South Carolina State Bulldogs",
+    "SoIllinois": "Southern Illinois Salukis",
+    "SoMississippi": "Southern Miss Golden Eagles",
+    "StephenAustin": "Stephen F. Austin Lumberjacks",
+    "TXPanAmerican": "UT Rio Grande Valley Vaqueros",  # renamed 2015
+    "TennMartin": "UT Martin Skyhawks",
+    "TexSanAntonio": "UTSA Roadrunners",
+    "UL-Lafayette": "Louisiana Ragin' Cajuns",
+    "ULLafayette": "Louisiana Ragin' Cajuns",
+    "UMKC": "Kansas City Roos",
+    "UTRioGrandValley": "UT Rio Grande Valley Vaqueros",
+    "UtahValleySt": "Utah Valley Wolverines",
+    "WesternKy": "Western Kentucky Hilltoppers",
+    "IUPUI": "IU Indianapolis Jaguars",             # renamed 2024
     # Non-D1 exhibition opponents — no ESPN equivalent, intentionally absent:
-    # CentralMissouriSt, MetroState, PRMayaguez, IUPUI (pre-rename gaps)
+    # CentralMissouriSt, MetroState, PRMayaguez
 }
 
 
@@ -195,7 +217,7 @@ def main():
     unmatched = sorted(n for n, v in name_map.items() if v is None)
     print(f"\nTeam matching: {len(unique_sbr) - len(unmatched)}/{len(unique_sbr)} matched")
     if unmatched:
-        print(f"   Unmatched (add to ABBREV or ignore): {unmatched[:25]}")
+        print(f"   Unmatched (add to ABBREV or ignore): {unmatched}")
 
     lines["home_team"] = lines["sbr_home"].map(name_map)
     lines["away_team"] = lines["sbr_away"].map(name_map)
