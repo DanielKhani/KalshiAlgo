@@ -254,7 +254,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--odds-file", type=str, default=None,
                         help="CSV with game_id + market_home_prob columns (real closing lines)")
+    parser.add_argument("--negative-control", action="store_true",
+                        help="Sanity check: zero-edge bettor vs equally-sharp market. "
+                             "ROI MUST come out negative or the harness is broken.")
     args = parser.parse_args()
+    if args.negative_control:
+        import numpy as _np
+        oof = load_oof_predictions()
+        rng = _np.random.default_rng(7)
+        market = oof["model_prob"].values
+        bettor = _np.clip(market + rng.normal(0, 0.05, len(market)), 0.01, 0.99)
+        res = simulate_kalshi_trading(oof["y_true"].values, bettor, market,
+                                      seasons=oof["season"].values)
+        print(f"NEGATIVE CONTROL — zero-edge bettor vs equally-sharp market")
+        print(f"  bets: {res['n_bets']} | ROI: {res['roi']:+.1%} | "
+              f"profit: ${res['total_profit']:,.0f} | fees: ${res['total_fees']:,.0f}")
+        verdict = "PASS ✅ (harness correctly punishes zero-edge betting)" if res["roi"] < 0 \
+                  else "FAIL ❌ — the simulator is leaking somewhere, do NOT trust backtests"
+        print(f"  {verdict}")
+        raise SystemExit(0)
     print("🏀 NCAAB Kalshi Backtest")
     print("=" * 64)
     run_backtest(odds_file=args.odds_file)
