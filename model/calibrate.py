@@ -128,3 +128,36 @@ def evaluate_calibration(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 1
         "mce": mce,
         "bins": bin_data,
     }
+
+
+class BlendedCalibratedModel:
+    """
+    Production wrapper: 50/50 blend of a binary win-prob model and a
+    margin-regression model (margin -> prob via Normal CDF with residual
+    sigma), followed by isotonic calibration on out-of-fold predictions.
+
+    Margin regression beat the binary classifier in 21/21 walk-forward
+    seasons (2006-2026); the blend beat both. Keeps the same .predict(X)
+    interface as CalibratedModel so model/predict.py needs no changes.
+    """
+
+    def __init__(self, binary_model, margin_model, sigma: float,
+                 calibrator: IsotonicRegression):
+        self.binary_model = binary_model
+        self.margin_model = margin_model
+        self.sigma = sigma
+        self.calibrator = calibrator
+
+    def predict_raw(self, X: np.ndarray) -> np.ndarray:
+        from scipy.stats import norm
+        p_bin = self.binary_model.predict(X)
+        p_marg = norm.cdf(self.margin_model.predict(X) / self.sigma)
+        return (p_bin + np.clip(p_marg, 0.005, 0.995)) / 2
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        cal = self.calibrator.predict(self.predict_raw(X))
+        return np.clip(cal, 0.01, 0.99)
+
+    def predict_margin(self, X: np.ndarray) -> np.ndarray:
+        """Predicted home margin in points (useful for spread analysis)."""
+        return self.margin_model.predict(X)

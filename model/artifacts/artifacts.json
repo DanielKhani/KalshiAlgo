@@ -153,12 +153,12 @@
   ],
   "n_rounds": 77,
   "cv_aggregate": {
-    "mean_log_loss": 0.5254326535183743,
-    "mean_accuracy": 0.7279245875648506,
-    "mean_brier": 0.17736044671418486,
-    "overall_log_loss": 0.5249313315616247,
-    "overall_accuracy": 0.7282290166850174,
-    "overall_brier": 0.1771640753830832,
+    "mean_log_loss": 0.5219080593808215,
+    "mean_accuracy": 0.729650717808345,
+    "mean_brier": 0.17618197643969577,
+    "overall_log_loss": 0.5214352674288835,
+    "overall_accuracy": 0.7299313966291183,
+    "overall_brier": 0.17599480774556764,
     "median_best_iteration": 77
   },
   "feature_importance": {

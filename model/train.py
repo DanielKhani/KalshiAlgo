@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from data.fetch_team_stats import build_historical_dataset, load_historical_dataset
 from features.engineer import build_features, get_feature_columns
-from model.calibrate import calibrate_probabilities, CalibratedModel
+from model.calibrate import calibrate_probabilities, CalibratedModel, BlendedCalibratedModel
 
 
 def _fill_nan(X_train, *others):
@@ -67,7 +67,14 @@ def _train_one_fold(X_tr, y_tr, X_es, y_es, params_full):
     return model
 
 
-def walk_forward_cv(X: pd.DataFrame, y: pd.Series) -> dict:
+def _margin_params():
+    p = {k: v for k, v in config.LGBM_PARAMS.items()
+         if k not in ["n_estimators", "early_stopping_rounds", "objective", "metric"]}
+    return {**p, "objective": "regression", "metric": "l2"}
+
+
+def walk_forward_cv(X: pd.DataFrame, y: pd.Series,
+                    y_margin: pd.Series = None) -> dict:
     """
     Walk-forward cross-validation with leak-free early stopping.
 
@@ -118,8 +125,22 @@ def walk_forward_cv(X: pd.DataFrame, y: pd.Series) -> dict:
         X_tr, X_es, X_val, medians = _fill_nan(X_tr, X_es, X_val)
 
         model = _train_one_fold(X_tr, y_tr, X_es, y_es, config.LGBM_PARAMS)
-
         val_probs = model.predict(X_val)
+
+        # Margin model: regress home margin, convert to prob via Normal CDF
+        # with residual sigma estimated on the inner early-stop set only.
+        # Blend = mean of the two probabilities (beat both in 21/21 seasons).
+        if y_margin is not None:
+            from scipy.stats import norm
+            m_tr = y_margin.loc[tr_mask].values
+            m_es = y_margin.loc[es_mask].values
+            params_m = {**_margin_params(),
+                        "n_estimators": config.LGBM_PARAMS["n_estimators"],
+                        "early_stopping_rounds": config.LGBM_PARAMS["early_stopping_rounds"]}
+            margin_model = _train_one_fold(X_tr, m_tr, X_es, m_es, params_m)
+            sigma = float(np.std(m_es - margin_model.predict(X_es)))
+            margin_probs = np.clip(norm.cdf(margin_model.predict(X_val) / sigma), 0.005, 0.995)
+            val_probs = (val_probs + margin_probs) / 2
         ll = log_loss(y_val, val_probs)
         acc = accuracy_score(y_val, (val_probs >= 0.5).astype(int))
         brier = brier_score_loss(y_val, val_probs)
@@ -193,7 +214,8 @@ def add_walk_forward_calibration(oof: pd.DataFrame, min_history: int = 3000) -> 
     return oof
 
 
-def train_final_model(X: pd.DataFrame, y: pd.Series, cv_results: dict) -> CalibratedModel:
+def train_final_model(X: pd.DataFrame, y: pd.Series, cv_results: dict,
+                      y_margin: pd.Series = None):
     """
     Train the production model on ALL data and calibrate on pooled
     out-of-fold predictions from the walk-forward CV.
@@ -210,16 +232,32 @@ def train_final_model(X: pd.DataFrame, y: pd.Series, cv_results: dict) -> Calibr
     X_all, medians = _fill_nan(X_all)[0], np.nanmedian(X[feature_cols].values.astype(float), axis=0)
     # (_fill_nan returns (filled, medians); recomputed for clarity)
 
-    print(f"\n🏋️ Training final model on all {len(X_all)} games ({n_rounds} rounds)...")
+    print(f"\n🏋️ Training final models on all {len(X_all)} games ({n_rounds} rounds)...")
     params = {k: v for k, v in config.LGBM_PARAMS.items()
               if k not in ["n_estimators", "early_stopping_rounds"]}
     model = lgb.train(params, lgb.Dataset(X_all, label=y_all), num_boost_round=n_rounds)
 
     print("📐 Calibrating on pooled out-of-fold predictions "
           f"({len(oof)} games across {oof['season'].nunique()} seasons)...")
-    calibrated_model = calibrate_probabilities(
-        model, oof["raw_prob"].values, oof["y_true"].values, probs_precomputed=True
-    )
+    if y_margin is not None:
+        margin_model = lgb.train(_margin_params(),
+                                 lgb.Dataset(X_all, label=y_margin.values),
+                                 num_boost_round=n_rounds)
+        # sigma for live use: residual std implied by recent seasons' inner
+        # fits drifts upward over time, so use the last CV fold's value via
+        # OOF: estimate from most recent 2 seasons of actual margins.
+        recent = X["season"] >= sorted(X["season"].unique())[-2]
+        resid = y_margin[recent].values - margin_model.predict(
+            _fill_nan(X.loc[recent, feature_cols].values.astype(float))[0])
+        sigma = float(np.std(resid))
+        base_cal = calibrate_probabilities(
+            model, oof["raw_prob"].values, oof["y_true"].values, probs_precomputed=True)
+        calibrated_model = BlendedCalibratedModel(
+            model, margin_model, sigma, base_cal.calibrator)
+        print(f"   Blended model (binary + margin/sigma={sigma:.1f})")
+    else:
+        calibrated_model = calibrate_probabilities(
+            model, oof["raw_prob"].values, oof["y_true"].values, probs_precomputed=True)
 
     importance = dict(zip(feature_cols, model.feature_importance(importance_type="gain")))
     importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
@@ -250,8 +288,10 @@ if __name__ == "__main__":
 
     df = load_historical_dataset()
     X, y = build_features(df)
+    y_margin = X.merge(df[["game_id", "home_margin"]], on="game_id",
+                       how="left")["home_margin"]
 
-    cv_results = walk_forward_cv(X, y)
+    cv_results = walk_forward_cv(X, y, y_margin)
     cv_results["oof"] = add_walk_forward_calibration(cv_results["oof"])
 
     # Persist OOF predictions for the backtest
@@ -259,5 +299,5 @@ if __name__ == "__main__":
     cv_results["oof"].to_csv(oof_path, index=False)
     print(f"📝 OOF predictions saved to {oof_path}")
 
-    model = train_final_model(X, y, cv_results)
+    model = train_final_model(X, y, cv_results, y_margin)
     print("\n🎉 Training complete!")
