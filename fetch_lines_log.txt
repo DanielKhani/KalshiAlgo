@@ -13,11 +13,11 @@
 📡 2019-20 ... 5320 games
 📡 2020-21 ... 3808 games
 
-Team matching: 445/495 matched
-   Unmatched (add to ABBREV or ignore): ['CalPolySLO', 'CentralMissouriSt', 'CharlestonSou', 'CollCharleston', 'CollOfCharleston', 'DixieState', 'EastTennSt.', 'EastTennState', 'FairDickinson', 'FlaAtlantic', 'FlaGulfCoast', 'FullertonSt.', 'GeoWashington', 'IPFW', 'IUPUI', 'MDBaltimoreCo', 'MDEasternShore', 'MetroState', 'MoKansasCity', "Mt.St.Mary's", 'NDakotaSt', 'No.Colorado', 'NoIllinois', 'NorthernArz', 'PRMayaguez']
+Team matching: 466/495 matched
+   Unmatched (add to ABBREV or ignore): ['CentralMissouriSt', 'IUPUI', 'MetroState', 'PRMayaguez', 'SCUpstate', 'SCarUpstate', 'SDakotaSt', 'SaintMarysCA', 'SanJoseState', 'SoCarolinaSt', 'SoIllinois', 'SoMississippi', 'StephenAustin', 'StillmanCollege', 'TXPanAmerican', 'TennMartin', 'TexSanAntonio', 'UL-Lafayette', 'ULLafayette', 'UMKC', 'USC-Upstate', 'USCUpstate', 'UTRioGrandValley', 'UtahValleySt', 'WesternKy']
 
-✅ 10575 games with closing lines matched to ESPN game_ids
-   (13% of 80148 ESPN games in those seasons)
+✅ 29615 games with closing lines matched to ESPN game_ids
+   (37% of 80148 ESPN games in those seasons)
    Saved to /Users/danielkhani/PycharmProjects/ncaab-kalshi-model/data/stored/closing_lines.csv
 
 Next: python -m backtest.evaluate --odds-file /Users/danielkhani/PycharmProjects/ncaab-kalshi-model/data/stored/closing_lines.csv
